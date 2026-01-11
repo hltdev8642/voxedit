@@ -1,0 +1,30 @@
+# VoxEdit - Teardown VOX Editor Requirements
+# Core Dependencies
+
+# GUI Framework
+PyQt6>=6.6.0
+PyQt6-3D>=6.6.0
+
+# OpenGL Rendering
+PyOpenGL>=3.1.7
+PyOpenGL-accelerate>=3.1.7
+
+# Numerical Computing
+numpy>=1.26.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# 3D Mesh Operations
+trimesh>=4.0.0
+pyglet>=2.0.0
+
+# File Format Support
+plyfile>=1.0.0
+nbtlib>=2.0.0
+
+# Color utilities
+colorama>=0.4.6
+
+# Optional: For enhanced mesh operations
+scipy>=1.11.0
