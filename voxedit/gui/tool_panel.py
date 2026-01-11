@@ -367,6 +367,10 @@ class ToolPanel(QWidget):
         """Get the currently selected tool."""
         return self.current_tool
     
+    def get_current_color(self) -> int:
+        """Get the currently selected color index."""
+        return self.current_color
+    
     def get_brush_size(self) -> int:
         """Get the current brush size."""
         return self.brush_size.value()

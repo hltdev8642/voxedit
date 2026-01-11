@@ -24,7 +24,7 @@ from voxedit.core.palette import VoxelPalette
 from voxedit.core.operations import VoxelOperations
 from voxedit.formats import FormatManager
 from voxedit.gui.viewport import VoxelViewport
-from voxedit.gui.tool_panel import ToolPanel
+from voxedit.gui.tool_panel import ToolPanel, Tool
 from voxedit.gui.palette_panel import PalettePanel
 
 
@@ -81,6 +81,8 @@ class MainWindow(QMainWindow):
     def _create_viewport(self):
         """Create the central 3D viewport."""
         self.viewport = VoxelViewport(self)
+        self.viewport.voxelClicked.connect(self._on_voxel_clicked)
+        self.viewport.voxelHovered.connect(self._on_voxel_hovered)
         self.setCentralWidget(self.viewport)
     
     def _create_panels(self):
@@ -142,7 +144,7 @@ class MainWindow(QMainWindow):
         
         self.action_new = QAction("&New", self)
         self.action_new.setShortcut(QKeySequence.StandardKey.New)
-        self.action_new.triggered.connect(self.new_model)
+        self.action_new.triggered.connect(lambda: self.new_model())
         file_menu.addAction(self.action_new)
         
         self.action_open = QAction("&Open...", self)
@@ -273,6 +275,15 @@ class MainWindow(QMainWindow):
         
         view_menu.addSeparator()
         
+        self.action_show_cursor = QAction("Show &Cursor", self)
+        self.action_show_cursor.setCheckable(True)
+        self.action_show_cursor.setChecked(True)
+        self.action_show_cursor.setShortcut("C")
+        self.action_show_cursor.triggered.connect(self._toggle_cursor)
+        view_menu.addAction(self.action_show_cursor)
+        
+        view_menu.addSeparator()
+        
         self.action_reset_view = QAction("&Reset View", self)
         self.action_reset_view.setShortcut("Home")
         self.action_reset_view.triggered.connect(self._reset_view)
@@ -389,6 +400,9 @@ class MainWindow(QMainWindow):
         
         self.status_size = QLabel("Size: 0×0×0")
         self.statusbar.addPermanentWidget(self.status_size)
+        
+        self.status_cursor = QLabel("Cursor: (0,0,0)")
+        self.statusbar.addPermanentWidget(self.status_cursor)
     
     def _update_window_title(self):
         """Update the window title based on current state."""
@@ -485,6 +499,9 @@ class MainWindow(QMainWindow):
         self.palette = VoxelPalette()
         self.operations = VoxelOperations(self.model)
         
+        # Create a test model with some voxels for demonstration
+        self._create_demo_model()
+        
         self.current_file = None
         self.modified = False
         
@@ -497,6 +514,52 @@ class MainWindow(QMainWindow):
         self._update_window_title()
         self._update_info()
         self.statusbar.showMessage("Created new model", 3000)
+    
+    def _create_demo_model(self):
+        """Create a demonstration model with various shapes."""
+        if self.model is None:
+            return
+        
+        # Clear the model first
+        self.model.clear()
+        
+        # Create a colorful cube in the center
+        center_x, center_y, center_z = 16, 16, 16
+        
+        # Main cube (4x4x4)
+        for x in range(center_x - 2, center_x + 2):
+            for y in range(center_y - 2, center_y + 2):
+                for z in range(center_z - 2, center_z + 2):
+                    if self.model.is_valid_position(x, y, z):
+                        self.model.set_voxel(x, y, z, 1)  # Red
+        
+        # Add some details - smaller cubes on corners
+        corners = [
+            (center_x - 3, center_y - 3, center_z - 3),
+            (center_x + 3, center_y - 3, center_z - 3),
+            (center_x - 3, center_y + 3, center_z - 3),
+            (center_x + 3, center_y + 3, center_z - 3),
+            (center_x - 3, center_y - 3, center_z + 3),
+            (center_x + 3, center_y - 3, center_z + 3),
+            (center_x - 3, center_y + 3, center_z + 3),
+            (center_x + 3, center_y + 3, center_z + 3),
+        ]
+        
+        for corner in corners:
+            x, y, z = corner
+            if self.model.is_valid_position(x, y, z):
+                self.model.set_voxel(x, y, z, 2)  # Blue
+        
+        # Add a pillar
+        for y in range(center_y - 4, center_y + 4):
+            if self.model.is_valid_position(center_x, y, center_z):
+                self.model.set_voxel(center_x, y, center_z, 3)  # Green
+        
+        # Set up some colors in the palette
+        self.palette.set_color(1, 255, 100, 100)  # Red
+        self.palette.set_color(2, 100, 100, 255)  # Blue
+        self.palette.set_color(3, 100, 255, 100)  # Green
+        self.palette.set_color(4, 255, 255, 100)  # Yellow
     
     def open_file(self, filepath: str = None):
         """Open a voxel file."""
@@ -742,6 +805,11 @@ class MainWindow(QMainWindow):
         self.viewport.renderer.show_wireframe = checked
         self.viewport.update()
     
+    def _toggle_cursor(self, checked: bool):
+        """Toggle 3D cursor visibility."""
+        self.viewport.show_cursor = checked
+        self.viewport.update()
+    
     def _reset_view(self):
         """Reset the camera view."""
         self.viewport.camera.reset()
@@ -752,6 +820,58 @@ class MainWindow(QMainWindow):
     def _on_color_selected(self, color_index: int):
         """Handle color selection from palette."""
         self.tool_panel.set_current_color(color_index)
+    
+    def _on_voxel_hovered(self, x: int, y: int, z: int):
+        """Handle voxel hover to update cursor position in status bar."""
+        if x < 0:
+            self.status_cursor.setText("Cursor: (-,-,-)")
+        else:
+            self.status_cursor.setText(f"Cursor: ({x},{y},{z})")
+    
+    def _on_voxel_clicked(self, x: int, y: int, z: int, button: int):
+        """Handle voxel clicking with current tool."""
+        print(f"TOOL: _on_voxel_clicked called with ({x}, {y}, {z}), button={button}")
+        
+        if self.model is None or self.operations is None:
+            print("TOOL: Model or operations is None")
+            return
+        
+        # Get current tool and color
+        tool = self.tool_panel.get_current_tool()
+        color = self.tool_panel.get_current_color()
+        
+        print(f"TOOL: Using tool {tool}, color {color}")
+        
+        # Apply tool to voxel
+        self._push_undo()
+        
+        if tool == Tool.PENCIL:
+            print(f"TOOL: Applying pencil tool at ({x}, {y}, {z}) with color {color}")
+            self.model.set_voxel(x, y, z, color)
+        elif tool == Tool.ERASER:
+            print(f"TOOL: Applying eraser tool at ({x}, {y}, {z})")
+            self.model.set_voxel(x, y, z, 0)
+        elif tool == Tool.EYEDROPPER:
+            # Pick color from voxel
+            picked_color = self.model.get_voxel(x, y, z)
+            print(f"TOOL: Eyedropper picked color {picked_color} from ({x}, {y}, {z})")
+            if picked_color != 0:
+                self.tool_panel.set_current_color(picked_color)
+                self.palette_panel.select_color(picked_color)
+        elif tool == Tool.FILL:
+            # Flood fill from clicked voxel
+            print(f"TOOL: Applying fill tool at ({x}, {y}, {z}) with color {color}")
+            self.model.flood_fill((x, y, z), color)
+        elif tool == Tool.PAINT:
+            # Paint over existing voxel (only if it exists)
+            if self.model.get_voxel(x, y, z) != 0:
+                print(f"TOOL: Applying paint tool at ({x}, {y}, {z}) with color {color}")
+                self.model.set_voxel(x, y, z, color)
+        
+        # Update display
+        self.viewport.rebuild_mesh()
+        self._update_info()
+        self.modified = True
     
     def _tool_fill(self):
         """Fill operation - placeholder."""

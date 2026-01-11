@@ -362,6 +362,7 @@ class VoxelViewport(QOpenGLWidget):
     
     voxelClicked = pyqtSignal(int, int, int, int)  # x, y, z, button
     voxelHovered = pyqtSignal(int, int, int)  # x, y, z
+    cursorMoved = pyqtSignal(int, int, int)  # x, y, z
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -371,6 +372,10 @@ class VoxelViewport(QOpenGLWidget):
         
         self.model: Optional[VoxelModel] = None
         self.palette: Optional[VoxelPalette] = None
+        
+        # 3D cursor state
+        self.cursor_position: Optional[Tuple[int, int, int]] = None
+        self.show_cursor = True
         
         # OpenGL context state
         self._gl_initialized = False
@@ -517,6 +522,10 @@ class VoxelViewport(QOpenGLWidget):
         # Render bounds
         if self.model is not None:
             self.renderer.render_bounds(self.model.size)
+        
+        # Render 3D cursor
+        if self.show_cursor and self.cursor_position is not None:
+            self._render_cursor()
     
     def mousePressEvent(self, event: QMouseEvent):
         """Handle mouse press."""
@@ -525,13 +534,242 @@ class VoxelViewport(QOpenGLWidget):
         
         # Handle voxel clicking
         if event.button() == Qt.MouseButton.LeftButton:
-            # TODO: Implement ray casting for voxel selection
-            pass
+            voxel_pos = self._get_voxel_at_mouse(event.pos())
+            if voxel_pos is not None:
+                x, y, z = voxel_pos
+                self.voxelClicked.emit(x, y, z, event.button())
+    
+    def _get_voxel_at_mouse(self, mouse_pos: QPoint) -> Optional[Tuple[int, int, int]]:
+        """Cast ray from mouse position and find intersected voxel."""
+        if self.model is None:
+            return None
+        
+        # Use window coordinates (pixels) and convert to OpenGL bottom-left origin
+        width, height = self.width(), self.height()
+        if width == 0 or height == 0:
+            return None
+
+        # Account for device pixel ratio (HiDPI displays) — OpenGL viewport uses device pixels
+        scale = 1.0
+        try:
+            scale = float(self.devicePixelRatioF())
+        except Exception:
+            # Fall back on integer DPI if function missing
+            try:
+                scale = float(self.devicePixelRatio())
+            except Exception:
+                scale = 1.0
+
+        win_x = mouse_pos.x() * scale
+        win_y = (height - mouse_pos.y()) * scale  # OpenGL origin is bottom-left
+
+        # Create ray from camera through mouse window position
+        ray_origin, ray_direction = self._screen_to_world_ray(win_x, win_y)
+        
+        # Find intersection with voxels
+        result = self._ray_voxel_intersection(ray_origin, ray_direction)
+        return result
+    
+    def _screen_to_world_ray(self, win_x: float, win_y: float) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+        """Convert window (pixel) coordinates to a world space ray.
+
+        Uses the current camera transform to build a modelview matrix before
+        calling gluUnProject so that the unprojected points match the view
+        used for rendering.
+        """
+        # Ensure OpenGL context is current and set the camera matrix
+        if HAS_OPENGL:
+            self.makeCurrent()
+            glMatrixMode(GL_MODELVIEW)
+            glPushMatrix()
+            glLoadIdentity()
+            pos = self.camera.position
+            target = self.camera.target
+            gluLookAt(
+                pos[0], pos[1], pos[2],
+                target[0], target[1], target[2],
+                0.0, 1.0, 0.0
+            )
+
+        # Read projection and modelview matrices and viewport
+        projection = glGetDoublev(GL_PROJECTION_MATRIX)
+        modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
+        viewport = glGetIntegerv(GL_VIEWPORT)
+
+        # Unproject near and far points using window coordinates
+        near_pos = gluUnProject(win_x, win_y, 0.0, modelview, projection, viewport)
+        far_pos = gluUnProject(win_x, win_y, 1.0, modelview, projection, viewport)
+
+        if HAS_OPENGL:
+            glPopMatrix()
+
+        # Use camera position directly (more reliable than extracting from matrix)
+        camera_pos = self.camera.position
+
+        # Ray goes from camera position through the far point
+        ray_origin = camera_pos
+        ray_direction = (
+            far_pos[0] - camera_pos[0],
+            far_pos[1] - camera_pos[1],
+            far_pos[2] - camera_pos[2]
+        )
+
+        # Normalize ray direction
+        length = math.sqrt(sum(d * d for d in ray_direction))
+        if length > 0:
+            ray_direction = tuple(d / length for d in ray_direction)
+
+        return ray_origin, ray_direction
+    
+    def _ray_voxel_intersection(self, ray_origin: Tuple[float, float, float], 
+                               ray_direction: Tuple[float, float, float]) -> Optional[Tuple[int, int, int]]:
+        """Find the voxel position where the ray intersects with existing voxels or model surface."""
+        if self.model is None:
+            return None
+        
+        # Normalize ray direction
+        dir_length = math.sqrt(ray_direction[0]**2 + ray_direction[1]**2 + ray_direction[2]**2)
+        if dir_length == 0:
+            return None
+        
+        dir_x, dir_y, dir_z = (
+            ray_direction[0] / dir_length,
+            ray_direction[1] / dir_length,
+            ray_direction[2] / dir_length
+        )
+        
+        # Get model bounds (centered at origin in world space)
+        size_x, size_y, size_z = self.model.size
+        half_x, half_y, half_z = size_x / 2, size_y / 2, size_z / 2
+        
+        # First, find intersection with model bounding box
+        bbox_intersection = self._ray_bbox_intersection(ray_origin, ray_direction, 
+                                                       (-half_x, -half_y, -half_z), 
+                                                       (half_x, half_y, half_z))
+        
+        if bbox_intersection is None:
+            return None
+        
+        # Start from the bounding box intersection point
+        start_t = bbox_intersection
+        max_distance = 200.0
+        step_size = 0.1  # Smaller step size for better precision
+        
+        # Step through the ray and find the first occupied voxel
+        for t in np.arange(start_t, start_t + max_distance, step_size):
+            # Calculate current position along ray
+            current_pos = (
+                ray_origin[0] + t * dir_x,
+                ray_origin[1] + t * dir_y,
+                ray_origin[2] + t * dir_z
+            )
+            
+            # Convert to voxel coordinates (model is centered at origin)
+            vx = int(round(current_pos[0] + half_x))
+            vy = int(round(current_pos[1] + half_y))
+            vz = int(round(current_pos[2] + half_z))
+            
+            # Check if within model bounds
+            if (0 <= vx < size_x and 0 <= vy < size_y and 0 <= vz < size_z):
+                # Check if this voxel is occupied
+                if self.model.get_voxel(vx, vy, vz) > 0:
+                    # Found an occupied voxel, return the position where we would place a new voxel
+                    # (just in front of this occupied voxel along the ray)
+                    return (vx, vy, vz)
+        
+        # If no occupied voxel found, return the position at the bounding box intersection
+        # This ensures cursor shows even when pointing at empty space within model bounds
+        intersection_pos = (
+            ray_origin[0] + start_t * dir_x,
+            ray_origin[1] + start_t * dir_y,
+            ray_origin[2] + start_t * dir_z
+        )
+        
+        vx = int(round(intersection_pos[0] + half_x))
+        vy = int(round(intersection_pos[1] + half_y))
+        vz = int(round(intersection_pos[2] + half_z))
+        
+        if (0 <= vx < size_x and 0 <= vy < size_y and 0 <= vz < size_z):
+            return (vx, vy, vz)
+        
+        return None
+    
+    def _ray_bbox_intersection(self, ray_origin: Tuple[float, float, float], 
+                              ray_direction: Tuple[float, float, float],
+                              bbox_min: Tuple[float, float, float],
+                              bbox_max: Tuple[float, float, float]) -> Optional[float]:
+        """Find the distance to the first intersection with an axis-aligned bounding box."""
+        # Normalize ray direction
+        dir_length = math.sqrt(ray_direction[0]**2 + ray_direction[1]**2 + ray_direction[2]**2)
+        if dir_length == 0:
+            return None
+        
+        dir_x, dir_y, dir_z = (
+            ray_direction[0] / dir_length,
+            ray_direction[1] / dir_length,
+            ray_direction[2] / dir_length
+        )
+        
+        # Calculate intersection with bounding box using slab method
+        t_min = 0.0
+        t_max = float('inf')
+        
+        # X slab
+        if abs(dir_x) > 1e-6:
+            t1 = (bbox_min[0] - ray_origin[0]) / dir_x
+            t2 = (bbox_max[0] - ray_origin[0]) / dir_x
+            t_min = max(t_min, min(t1, t2))
+            t_max = min(t_max, max(t1, t2))
+        else:
+            # Ray is parallel to X planes
+            if ray_origin[0] < bbox_min[0] or ray_origin[0] > bbox_max[0]:
+                return None
+        
+        # Y slab
+        if abs(dir_y) > 1e-6:
+            t1 = (bbox_min[1] - ray_origin[1]) / dir_y
+            t2 = (bbox_max[1] - ray_origin[1]) / dir_y
+            t_min = max(t_min, min(t1, t2))
+            t_max = min(t_max, max(t1, t2))
+        else:
+            # Ray is parallel to Y planes
+            if ray_origin[1] < bbox_min[1] or ray_origin[1] > bbox_max[1]:
+                return None
+        
+        # Z slab
+        if abs(dir_z) > 1e-6:
+            t1 = (bbox_min[2] - ray_origin[2]) / dir_z
+            t2 = (bbox_max[2] - ray_origin[2]) / dir_z
+            t_min = max(t_min, min(t1, t2))
+            t_max = min(t_max, max(t1, t2))
+        else:
+            # Ray is parallel to Z planes
+            if ray_origin[2] < bbox_min[2] or ray_origin[2] > bbox_max[2]:
+                return None
+        
+        if t_min > t_max or t_max < 0:
+            return None
+        
+        # Return the first intersection point (closest to ray origin)
+        return max(0.0, t_min)
     
     def mouseMoveEvent(self, event: QMouseEvent):
         """Handle mouse movement."""
         delta = event.pos() - self._last_mouse_pos
         self._last_mouse_pos = event.pos()
+        
+        # Update 3D cursor position
+        if self.show_cursor:
+            cursor_pos = self._get_voxel_at_mouse(event.pos())
+            if cursor_pos != self.cursor_position:
+                self.cursor_position = cursor_pos
+                self.update()  # Redraw to show cursor
+                if cursor_pos is not None:
+                    x, y, z = cursor_pos
+                    self.voxelHovered.emit(x, y, z)  # Emit hover signal
+                else:
+                    # Emit sentinel to indicate cleared hover
+                    self.voxelHovered.emit(-1, -1, -1)
         
         if event.buttons() & Qt.MouseButton.RightButton:
             # Orbit camera
@@ -541,6 +779,12 @@ class VoxelViewport(QOpenGLWidget):
             # Pan camera
             self.camera.pan(delta.x(), delta.y())
             self.update()
+        elif event.buttons() & Qt.MouseButton.LeftButton:
+            # Apply tool continuously while dragging
+            voxel_pos = self._get_voxel_at_mouse(event.pos())
+            if voxel_pos is not None:
+                x, y, z = voxel_pos
+                self.voxelClicked.emit(x, y, z, event.button())
     
     def wheelEvent(self, event: QWheelEvent):
         """Handle mouse wheel."""
@@ -560,6 +804,9 @@ class VoxelViewport(QOpenGLWidget):
             self.renderer.show_axes = not self.renderer.show_axes
         elif key == Qt.Key.Key_W:
             self.renderer.show_wireframe = not self.renderer.show_wireframe
+        elif key == Qt.Key.Key_C:
+            self.show_cursor = not self.show_cursor
+            self.update()
         
         self.update()
     
@@ -591,6 +838,71 @@ class VoxelViewport(QOpenGLWidget):
         image = np.flipud(image)  # Flip vertically
         
         return image
+    
+    def _render_cursor(self):
+        """Render the 3D cursor at the current position."""
+        if not HAS_OPENGL or self.cursor_position is None:
+            return
+        
+        x, y, z = self.cursor_position
+        
+        # Convert to world coordinates (centered)
+        if self.model is not None:
+            offset_x = -self.model.size[0] / 2
+            offset_y = -self.model.size[1] / 2
+            offset_z = -self.model.size[2] / 2
+        else:
+            offset_x = offset_y = offset_z = 0
+        
+        wx = x + offset_x
+        wy = y + offset_y
+        wz = z + offset_z
+        
+        glDisable(GL_LIGHTING)
+        glDisable(GL_DEPTH_TEST)  # Always show cursor on top
+        
+        # Draw wireframe cube with pulsing effect
+        import time
+        pulse = (math.sin(time.time() * 4) + 1) / 2  # 0 to 1
+        brightness = 0.7 + pulse * 0.3  # 0.7 to 1.0
+        
+        glColor3f(brightness, brightness, 0.0)  # Yellow cursor with pulsing
+        glLineWidth(4.0)
+        
+        # Make cursor slightly larger than a voxel
+        expand = 0.05
+        
+        # Bottom face
+        glBegin(GL_LINE_LOOP)
+        glVertex3f(wx - expand, wy - expand, wz - expand)
+        glVertex3f(wx + 1 + expand, wy - expand, wz - expand)
+        glVertex3f(wx + 1 + expand, wy - expand, wz + 1 + expand)
+        glVertex3f(wx - expand, wy - expand, wz + 1 + expand)
+        glEnd()
+        
+        # Top face
+        glBegin(GL_LINE_LOOP)
+        glVertex3f(wx - expand, wy + 1 + expand, wz - expand)
+        glVertex3f(wx + 1 + expand, wy + 1 + expand, wz - expand)
+        glVertex3f(wx + 1 + expand, wy + 1 + expand, wz + 1 + expand)
+        glVertex3f(wx - expand, wy + 1 + expand, wz + 1 + expand)
+        glEnd()
+        
+        # Vertical edges
+        glBegin(GL_LINES)
+        glVertex3f(wx - expand, wy - expand, wz - expand)
+        glVertex3f(wx - expand, wy + 1 + expand, wz - expand)
+        glVertex3f(wx + 1 + expand, wy - expand, wz - expand)
+        glVertex3f(wx + 1 + expand, wy + 1 + expand, wz - expand)
+        glVertex3f(wx + 1 + expand, wy - expand, wz + 1 + expand)
+        glVertex3f(wx + 1 + expand, wy + 1 + expand, wz + 1 + expand)
+        glVertex3f(wx - expand, wy - expand, wz + 1 + expand)
+        glVertex3f(wx - expand, wy + 1 + expand, wz + 1 + expand)
+        glEnd()
+        
+        glLineWidth(1.0)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_LIGHTING)
     
     def closeEvent(self, event):
         """Clean up on close."""
