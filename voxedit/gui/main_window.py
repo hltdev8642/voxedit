@@ -8,7 +8,8 @@ and central 3D viewport for the VoxEdit editor.
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
+import math
 
 from PyQt6.QtWidgets import (
     QMainWindow, QApplication, QMenuBar, QMenu, QToolBar,
@@ -16,7 +17,7 @@ from PyQt6.QtWidgets import (
     QProgressDialog, QInputDialog, QWidget, QVBoxLayout,
     QLabel, QSplitter
 )
-from PyQt6.QtCore import Qt, QSettings, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QSettings, QTimer, pyqtSignal, QEvent
 from PyQt6.QtGui import QAction, QIcon, QKeySequence, QCloseEvent
 
 from voxedit.core.voxel_model import VoxelModel
@@ -71,9 +72,23 @@ class MainWindow(QMainWindow):
         self._create_menus()
         self._create_toolbars()
         self._create_statusbar()
+        self._create_axis_shortcuts()
         
         # Load settings
         self._load_settings()
+
+        # Install an application-level event filter to catch raw key press/release events
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
+        except Exception:
+            pass
+
+        # Track pressed modifier/axis keys to ignore autorepeat noise
+        self._pressed_keys = set()
+        # Track which axis key presses we've already handled in the eventFilter to avoid duplicate toggles
+        self._handled_axis_presses = set()
         
         # Create new empty model
         self.new_model()
@@ -83,12 +98,63 @@ class MainWindow(QMainWindow):
         self.viewport = VoxelViewport(self)
         self.viewport.voxelClicked.connect(self._on_voxel_clicked)
         self.viewport.voxelHovered.connect(self._on_voxel_hovered)
+        self.viewport.toolDragStarted.connect(self._on_tool_drag_started)
+        self.viewport.toolDragEnded.connect(self._on_tool_drag_ended)
+        self.viewport.axisLockChanged.connect(self._on_axis_lock_changed)
+        self._dragging = False
+        self._tool_start = None
         self.setCentralWidget(self.viewport)
+
+    def keyPressEvent(self, event):
+        """Forward key press events to viewport for axis lock toggling (X/Y/Z)."""
+        try:
+            print(f"MainWindow keyPressEvent: key={event.key()}, autorepeat={event.isAutoRepeat()}, focus={self.focusWidget().__class__.__name__ if self.focusWidget() else None}")
+        except Exception:
+            print("MainWindow keyPressEvent")
+
+        key = event.key()
+        # Ignore autorepeat noise
+        if event.isAutoRepeat():
+            return
+
+        if key == Qt.Key.Key_X:
+            self.viewport.toggle_axis_lock('x')
+            self.statusbar.showMessage(f"Toggled axis X: {'ON' if 'x' in self.viewport._axis_locks else 'OFF'}", 1500)
+            return
+        elif key == Qt.Key.Key_Y:
+            self.viewport.toggle_axis_lock('y')
+            self.statusbar.showMessage(f"Toggled axis Y: {'ON' if 'y' in self.viewport._axis_locks else 'OFF'}", 1500)
+            return
+        elif key == Qt.Key.Key_Z:
+            self.viewport.toggle_axis_lock('z')
+            self.statusbar.showMessage(f"Toggled axis Z: {'ON' if 'z' in self.viewport._axis_locks else 'OFF'}", 1500)
+            return
+
+        super().keyPressEvent(event)
+    def keyReleaseEvent(self, event):
+        """Forward key release events to viewport for axis lock clearing.
+
+        Ignores autorepeat and only clears locks for keys we previously saw
+        pressed.
+        """
+        try:
+            print(f"MainWindow keyReleaseEvent: key={event.key()}, autorepeat={event.isAutoRepeat()}, focus={self.focusWidget().__class__.__name__ if self.focusWidget() else None}")
+        except Exception:
+            print("MainWindow keyReleaseEvent")
+
+        # Ignore autorepeat noise
+        if event.isAutoRepeat():
+            return
+
+        key = event.key()
+        # In toggle mode, releasing X/Y/Z does not clear locks — keep default behavior
+        super().keyReleaseEvent(event)
     
     def _create_panels(self):
         """Create dock widget panels."""
         # Tool Panel
         self.tool_dock = QDockWidget("Tools", self)
+        self.tool_dock.setObjectName("ToolsDock")
         self.tool_dock.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | 
             Qt.DockWidgetArea.RightDockWidgetArea
@@ -99,6 +165,7 @@ class MainWindow(QMainWindow):
         
         # Palette Panel
         self.palette_dock = QDockWidget("Palette", self)
+        self.palette_dock.setObjectName("PaletteDock")
         self.palette_dock.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | 
             Qt.DockWidgetArea.RightDockWidgetArea |
@@ -111,6 +178,7 @@ class MainWindow(QMainWindow):
         
         # Model Info Panel
         self.info_dock = QDockWidget("Model Info", self)
+        self.info_dock.setObjectName("InfoDock")
         self.info_dock.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | 
             Qt.DockWidgetArea.RightDockWidgetArea
@@ -134,7 +202,79 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         
         self.info_dock.setWidget(widget)
-    
+
+    def _create_axis_shortcuts(self):
+        """Create fallback application-level shortcuts to toggle axis locks (Alt+X/Y/Z).
+        Uses application-scoped QActions to ensure reliability across platforms."""
+        act_x = QAction("Toggle Axis X", self)
+        act_x.setShortcut(QKeySequence("Alt+X"))
+        act_x.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        act_x.triggered.connect(lambda: self._toggle_axis_lock('x'))
+        self.addAction(act_x)
+
+        act_y = QAction("Toggle Axis Y", self)
+        act_y.setShortcut(QKeySequence("Alt+Y"))
+        act_y.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        act_y.triggered.connect(lambda: self._toggle_axis_lock('y'))
+        self.addAction(act_y)
+
+        act_z = QAction("Toggle Axis Z", self)
+        act_z.setShortcut(QKeySequence("Alt+Z"))
+        act_z.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        act_z.triggered.connect(lambda: self._toggle_axis_lock('z'))
+        self.addAction(act_z)
+
+    def _toggle_axis_lock(self, axis: str):
+        """Toggle axis lock on the viewport as a fallback when hold-release events aren't reliable."""
+        if not hasattr(self, 'viewport') or self.viewport is None:
+            return
+        self.viewport.toggle_axis_lock(axis)
+        state = 'ON' if axis in self.viewport._axis_locks else 'OFF'
+        self.statusbar.showMessage(f"Axis {axis.upper()} toggled: {state}", 1500)
+
+    def eventFilter(self, obj, event):
+        """Application-level event filter to capture key press/release (works even if focus is odd)."""
+        if event.type() == QEvent.Type.KeyPress:
+            try:
+                print(f"EventFilter KeyPress: key={event.key()}, autorepeat={event.isAutoRepeat()}, obj={obj.__class__.__name__}")
+            except Exception:
+                print("EventFilter KeyPress")
+            # Toggle on first non-autorepeat press, but avoid duplicate toggles for the same
+            # physical press when the event is delivered to multiple Qt objects.
+            if not event.isAutoRepeat():
+                key = event.key()
+                if key == Qt.Key.Key_X:
+                    if 'x' not in self._handled_axis_presses:
+                        self._handled_axis_presses.add('x')
+                        self.viewport.toggle_axis_lock('x')
+                    return True
+                if key == Qt.Key.Key_Y:
+                    if 'y' not in self._handled_axis_presses:
+                        self._handled_axis_presses.add('y')
+                        self.viewport.toggle_axis_lock('y')
+                    return True
+                if key == Qt.Key.Key_Z:
+                    if 'z' not in self._handled_axis_presses:
+                        self._handled_axis_presses.add('z')
+                        self.viewport.toggle_axis_lock('z')
+                    return True
+        elif event.type() == QEvent.Type.KeyRelease:
+            try:
+                print(f"EventFilter KeyRelease: key={event.key()}, autorepeat={event.isAutoRepeat()}, obj={obj.__class__.__name__}")
+            except Exception:
+                print("EventFilter KeyRelease")
+            # Clear our handled marker on final release so the next press can toggle again
+            if not event.isAutoRepeat():
+                key = event.key()
+                if key == Qt.Key.Key_X and 'x' in self._handled_axis_presses:
+                    self._handled_axis_presses.remove('x')
+                if key == Qt.Key.Key_Y and 'y' in self._handled_axis_presses:
+                    self._handled_axis_presses.remove('y')
+                if key == Qt.Key.Key_Z and 'z' in self._handled_axis_presses:
+                    self._handled_axis_presses.remove('z')
+
+        return super().eventFilter(obj, event)        
+        # Edit menu
     def _create_menus(self):
         """Create the application menus."""
         menubar = self.menuBar()
@@ -226,7 +366,7 @@ class MainWindow(QMainWindow):
         self.action_exit.setShortcut(QKeySequence.StandardKey.Quit)
         self.action_exit.triggered.connect(self.close)
         file_menu.addAction(self.action_exit)
-        
+
         # Edit menu
         edit_menu = menubar.addMenu("&Edit")
         
@@ -266,6 +406,13 @@ class MainWindow(QMainWindow):
         self.action_show_axes.setChecked(True)
         self.action_show_axes.triggered.connect(self._toggle_axes)
         view_menu.addAction(self.action_show_axes)
+
+        # Allow swapping Y and Z axes if a model is authored with different convention
+        self.action_swap_yz = QAction("Swap Y/Z Axes", self)
+        self.action_swap_yz.setCheckable(True)
+        self.action_swap_yz.setChecked(False)
+        self.action_swap_yz.triggered.connect(self._toggle_swap_yz)
+        view_menu.addAction(self.action_swap_yz)
         
         self.action_wireframe = QAction("&Wireframe Mode", self)
         self.action_wireframe.setCheckable(True)
@@ -291,6 +438,15 @@ class MainWindow(QMainWindow):
         
         view_menu.addSeparator()
         
+        # Swap Y/Z handler inserted
+        def _toggle_swap_yz_local(checked: bool):
+            if hasattr(self, 'viewport') and self.viewport is not None:
+                self.viewport.swap_yz = checked
+                self.viewport.rebuild_mesh()
+                self.viewport.update()
+                self.statusbar.showMessage(f"Swap Y/Z set to {checked}", 1500)
+        self._toggle_swap_yz = _toggle_swap_yz_local
+
         # Dock visibility
         self.action_show_tools = self.tool_dock.toggleViewAction()
         self.action_show_tools.setText("&Tools Panel")
@@ -403,6 +559,10 @@ class MainWindow(QMainWindow):
         
         self.status_cursor = QLabel("Cursor: (0,0,0)")
         self.statusbar.addPermanentWidget(self.status_cursor)
+
+        # Axis lock indicator
+        self.status_axis = QLabel("")
+        self.statusbar.addPermanentWidget(self.status_axis)
     
     def _update_window_title(self):
         """Update the window title based on current state."""
@@ -434,6 +594,25 @@ class MainWindow(QMainWindow):
             self.info_file_label.setText(f"File: {Path(self.current_file).name}")
         else:
             self.info_file_label.setText("File: New")
+
+    def _on_axis_lock_changed(self, axis):
+        """Update status bar axis lock indicator when viewport changes lock state.
+
+        `axis` may be None or an iterable of axis chars (e.g., ('x','y')) when
+        multiple locks are active.
+        """
+        if not axis:
+            self.status_axis.setText("")
+            return
+        # Accept tuple/list/set or single value
+        if isinstance(axis, (list, tuple, set)):
+            parts = [f"[{a.upper()}]" for a in axis]
+            self.status_axis.setText(''.join(parts))
+        else:
+            try:
+                self.status_axis.setText(f"[{axis.upper()}]")
+            except Exception:
+                self.status_axis.setText("")
     
     def _update_recent_files(self):
         """Update the recent files menu."""
@@ -799,6 +978,14 @@ class MainWindow(QMainWindow):
         """Toggle axes visibility."""
         self.viewport.renderer.show_axes = checked
         self.viewport.update()
+
+    def _toggle_swap_yz(self, checked: bool):
+        """Toggle swapping Y and Z axes in the viewport (useful for differing model conventions)."""
+        if hasattr(self, 'viewport') and self.viewport is not None:
+            self.viewport.swap_yz = checked
+            self.viewport.rebuild_mesh()
+            self.viewport.update()
+            self.statusbar.showMessage(f"Swap Y/Z set to {checked}", 1500)
     
     def _toggle_wireframe(self, checked: bool):
         """Toggle wireframe mode."""
@@ -823,10 +1010,18 @@ class MainWindow(QMainWindow):
     
     def _on_voxel_hovered(self, x: int, y: int, z: int):
         """Handle voxel hover to update cursor position in status bar."""
+        lock_suffix = ''
+        try:
+            locks = getattr(self.viewport, '_axis_locks', None)
+            if locks:
+                lock_suffix = ' ' + ''.join([f'[{a.upper()}]' for a in sorted(locks)])
+        except Exception:
+            lock_suffix = ''
+
         if x < 0:
-            self.status_cursor.setText("Cursor: (-,-,-)")
+            self.status_cursor.setText(f"Cursor: (-,-,-){lock_suffix}")
         else:
-            self.status_cursor.setText(f"Cursor: ({x},{y},{z})")
+            self.status_cursor.setText(f"Cursor: ({x},{y},{z}){lock_suffix}")
     
     def _on_voxel_clicked(self, x: int, y: int, z: int, button: int):
         """Handle voxel clicking with current tool."""
@@ -842,15 +1037,24 @@ class MainWindow(QMainWindow):
         
         print(f"TOOL: Using tool {tool}, color {color}")
         
-        # Apply tool to voxel
-        self._push_undo()
-        
+        # If a drag was started, undo was already pushed once; otherwise push undo for this single action
+        if not getattr(self, '_dragging', False):
+            self._push_undo()
+
+        # Brush/shape parameters
+        brush_size = self.tool_panel.get_brush_size()
+        brush_shape = self.tool_panel.get_brush_shape()
+        mirror_axes = self.tool_panel.get_mirror_axes()
+
         if tool == Tool.PENCIL:
-            print(f"TOOL: Applying pencil tool at ({x}, {y}, {z}) with color {color}")
-            self.model.set_voxel(x, y, z, color)
+            print(f"TOOL: Applying pencil brush at ({x}, {y}, {z}) with color {color}, size {brush_size}")
+            self._apply_brush((x, y, z), brush_size, brush_shape, color, mirror_axes, mode='set')
         elif tool == Tool.ERASER:
-            print(f"TOOL: Applying eraser tool at ({x}, {y}, {z})")
-            self.model.set_voxel(x, y, z, 0)
+            print(f"TOOL: Applying eraser brush at ({x}, {y}, {z}), size {brush_size}")
+            self._apply_brush((x, y, z), brush_size, brush_shape, 0, mirror_axes, mode='set')
+        elif tool == Tool.PAINT:
+            print(f"TOOL: Applying paint brush at ({x}, {y}, {z}) with color {color}, size {brush_size}")
+            self._apply_brush((x, y, z), brush_size, brush_shape, color, mirror_axes, mode='paint')
         elif tool == Tool.EYEDROPPER:
             # Pick color from voxel
             picked_color = self.model.get_voxel(x, y, z)
@@ -862,20 +1066,108 @@ class MainWindow(QMainWindow):
             # Flood fill from clicked voxel
             print(f"TOOL: Applying fill tool at ({x}, {y}, {z}) with color {color}")
             self.model.flood_fill((x, y, z), color)
-        elif tool == Tool.PAINT:
-            # Paint over existing voxel (only if it exists)
-            if self.model.get_voxel(x, y, z) != 0:
-                print(f"TOOL: Applying paint tool at ({x}, {y}, {z}) with color {color}")
-                self.model.set_voxel(x, y, z, color)
+        elif tool in (Tool.LINE, Tool.BOX, Tool.SPHERE):
+            # Shape tools: start/finish behavior
+            if getattr(self, '_tool_start', None) is None:
+                self._tool_start = (x, y, z)
+                self.statusbar.showMessage(f"{tool.name} start set at {self._tool_start}", 2000)
+            else:
+                start = self._tool_start
+                end = (x, y, z)
+                print(f"TOOL: {tool.name} from {start} to {end} with color {color}")
+                if tool == Tool.LINE:
+                    self.operations.draw_line(start, end, value=color)
+                elif tool == Tool.BOX:
+                    self.operations.draw_box(start, end, value=color, filled=True)
+                elif tool == Tool.SPHERE:
+                    # Interpret distance as radius
+                    radius = max(1, int(round(math.dist(start, end))))
+                    self.operations.draw_sphere(end, radius, value=color)
+                self._tool_start = None
         
-        # Update display
-        self.viewport.rebuild_mesh()
-        self._update_info()
-        self.modified = True
+        # If not dragging, commit/finish immediately
+        if not getattr(self, '_dragging', False):
+            self.model.commit()
+            self.viewport.rebuild_mesh()
+            self._update_info()
+            self.modified = True
+        else:
+            # While dragging, just refresh visuals; final commit will happen on drag end
+            self.viewport.rebuild_mesh()
+            self._update_info()
+            self.modified = True
     
     def _tool_fill(self):
         """Fill operation - placeholder."""
         self.statusbar.showMessage("Fill tool - select area to fill", 3000)
+
+    def _apply_brush(self, center: Tuple[int, int, int], size: int, shape: str, value: int, mirror_axes: tuple, mode: str = 'set'):
+        """Apply a brush centered at `center`.
+
+        mode: 'set' = set to value, 'paint' = set to value only on existing voxels
+        """
+        if self.model is None:
+            return
+
+        cx, cy, cz = center
+        radius = max(0, (size - 1) // 2)
+
+        coords = []
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                for dz in range(-radius, radius + 1):
+                    if shape == 'square':
+                        ok = True
+                    elif shape == 'circle':
+                        ok = (dx*dx + dy*dy + dz*dz) <= (radius * radius)
+                    elif shape == 'diamond':
+                        ok = (abs(dx) + abs(dy) + abs(dz)) <= radius
+                    else:
+                        ok = True
+
+                    if not ok:
+                        continue
+
+                    x = cx + dx
+                    y = cy + dy
+                    z = cz + dz
+
+                    if not self.model.is_valid_position(x, y, z):
+                        continue
+
+                    coords.append((x, y, z))
+
+                    # mirror axes
+                    mx, my, mz = mirror_axes
+                    if mx:
+                        mxp = (cx - dx, y, z)
+                        if self.model.is_valid_position(*mxp):
+                            coords.append(mxp)
+                    if my:
+                        myp = (x, cy - dy, z)
+                        if self.model.is_valid_position(*myp):
+                            coords.append(myp)
+                    if mz:
+                        mzp = (x, y, cz - dz)
+                        if self.model.is_valid_position(*mzp):
+                            coords.append(mzp)
+
+        # Deduplicate
+        coords = list({(a,b,c) for a,b,c in coords})
+
+        # Apply changes
+        for x, y, z in coords:
+            if mode == 'set':
+                self.model.set_voxel(x, y, z, value)
+            elif mode == 'paint':
+                if self.model.get_voxel(x, y, z) != 0:
+                    self.model.set_voxel(x, y, z, value)
+
+        # If not dragging, commit immediately; otherwise visual update handled externally
+        if not getattr(self, '_dragging', False):
+            self.model.commit()
+        self.viewport.rebuild_mesh()
+        self._update_info()
     
     def _tool_replace(self):
         """Replace color operation."""
@@ -958,6 +1250,25 @@ class MainWindow(QMainWindow):
         self.viewport.rebuild_mesh()
         self._update_info()
         self.statusbar.showMessage("Applied smoothing", 3000)
+
+    def _on_tool_drag_started(self):
+        """Called when a drag operation starts in the viewport (begin grouped undo)."""
+        # Push a single undo entry per drag
+        if not getattr(self, '_dragging', False):
+            self._push_undo()
+            self._dragging = True
+            self._drag_was_active = True
+
+    def _on_tool_drag_ended(self):
+        """Called when a drag operation ends in the viewport (finalize commit)."""
+        if getattr(self, '_dragging', False):
+            # Finalize changes made during drag
+            if self.model is not None:
+                self.model.commit()
+            self.viewport.rebuild_mesh()
+            self._update_info()
+            self._dragging = False
+            self._drag_was_active = False
     
     # ==================== Help ====================
     

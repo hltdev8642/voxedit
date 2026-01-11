@@ -310,6 +310,15 @@ class ToolPanel(QWidget):
         self.attach_to_surface = QCheckBox("Attach to Surface")
         self.attach_to_surface.setChecked(True)
         options_layout.addWidget(self.attach_to_surface)
+
+        # Axis anchor selection for axis-lock behavior
+        anchor_layout = QHBoxLayout()
+        anchor_layout.addWidget(QLabel("Axis Anchor:"))
+        self.axis_anchor_combo = QComboBox()
+        self.axis_anchor_combo.addItems(["Cursor", "Surface/Placement", "World Center"])
+        self.axis_anchor_combo.setCurrentIndex(0)
+        anchor_layout.addWidget(self.axis_anchor_combo)
+        options_layout.addLayout(anchor_layout)
         
         layout.addWidget(options_group)
         
@@ -386,3 +395,12 @@ class ToolPanel(QWidget):
             self.mirror_y.isChecked(),
             self.mirror_z.isChecked()
         )
+
+    def get_axis_anchor_mode(self) -> str:
+        """Return axis anchor mode: 'cursor', 'surface', or 'center'. Default 'cursor'."""
+        text = self.axis_anchor_combo.currentText().lower()
+        if 'surface' in text:
+            return 'surface'
+        if 'center' in text:
+            return 'center'
+        return 'cursor'
