@@ -410,6 +410,42 @@ class VoxFormat:
             layers=layers
         )
     
+    def import_file(self, filepath: str) -> Tuple[VoxelModel, Optional[VoxelPalette]]:
+        """
+        Import a VOX file and return VoxelModel and VoxelPalette.
+        
+        Args:
+            filepath: Path to the VOX file
+            
+        Returns:
+            Tuple of (VoxelModel, VoxelPalette)
+        """
+        # Read the VOX scene
+        scene = self.read(filepath)
+        
+        # Convert to VoxelModel and VoxelPalette
+        # For now, use the first model if multiple models exist
+        if not scene.models:
+            raise ValueError("VOX file contains no models")
+        
+        vox_model = scene.models[0]  # Use first model
+        
+        # Create VoxelModel
+        voxel_model = VoxelModel(size=vox_model.size)
+        
+        # Add voxels
+        for x, y, z, color_idx in vox_model.voxels:
+            voxel_model.set_voxel(x, y, z, color_idx)
+        
+        # Create VoxelPalette
+        palette = VoxelPalette()
+        for i, (r, g, b, a) in enumerate(scene.palette):
+            if i >= 256:  # Palette is limited to 256 colors
+                break
+            palette.set_color(i, r, g, b, a)
+        
+        return voxel_model, palette
+    
     def _parse_dict(self, data: bytes) -> Dict[str, str]:
         """Parse a DICT structure from chunk content."""
         result = {}

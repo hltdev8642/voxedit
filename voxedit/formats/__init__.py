@@ -101,10 +101,10 @@ class FormatManager:
         # Create handler and read file
         handler = handler_class()
         
-        if hasattr(handler, 'read'):
-            return handler.read(filepath)
-        elif hasattr(handler, 'import_file'):
+        if hasattr(handler, 'import_file'):
             return handler.import_file(filepath)
+        elif hasattr(handler, 'read'):
+            return handler.read(filepath)
         else:
             raise ValueError(f"Handler for {ext} does not support import")
     
